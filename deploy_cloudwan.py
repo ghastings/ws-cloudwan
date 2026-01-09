@@ -9,28 +9,31 @@ import json
 import argparse
 import sys
 import time
+import os
 from typing import Dict, List, Any, Optional
 from dataclasses import dataclass
-from enum import Enum
 
+# Region mapping
+REGION_MAP = {
+    "stockholm": "eu-north-1",
+    "oregon": "us-west-2"
+}
 
-class DeploymentStep(Enum):
-    POLICY = "policy"
-    VPN = "vpn"
-    ATTACHMENTS = "attachments"
-    ROUTING = "routing"
-    ROUTES = "routes"
-    ALL = "all"
+# Route table configurations (same for both regions)
+ROUTE_CONFIGS = [
+    {"vpc_name": "prod-vpc-*", "route_table_name": "*Private*", "destination": "0.0.0.0/0"},
+    {"vpc_name": "thirdparty-vpc-*", "route_table_name": "*Private*", "destination": "0.0.0.0/0"},
+    {"vpc_name": "eastwest-inspection-vpc-*", "route_table_name": "*Firewall*", "destination": "0.0.0.0/0"},
+    {"vpc_name": "egress-inspection-vpc-*", "route_table_name": "*Firewall*", "destination": "10.0.0.0/8"},
+]
 
 
 @dataclass
 class AttachmentConfig:
     name: str
     edge_location: str
-    attachment_type: str
-    appliance_mode: str
+    appliance_mode: bool
     vpc_id: str
-    subnet_strategy: str
     tag_key: str
     tag_value: str
 
@@ -39,10 +42,14 @@ class AttachmentConfig:
 class VPNAttachmentConfig:
     name: str
     edge_location: str
-    attachment_type: str
-    vpn_id: str
     tag_key: str
     tag_value: str
+
+
+def get_account_id(session) -> str:
+    """Get AWS account ID from STS"""
+    sts = session.client('sts')
+    return sts.get_caller_identity()['Account']
 
 
 def get_network_policy(step: str = "initial") -> Dict[str, Any]:
@@ -60,34 +67,37 @@ def get_network_policy(step: str = "initial") -> Dict[str, Any]:
         sys.exit(1)
 
 
-def deploy_network_policy(networkmanager_client, core_network_id: str, step: str = "initial") -> Dict[str, Any]:
+def deploy_network_policy(nm_client, core_network_id: str, step: str = "initial") -> Dict[str, Any]:
     """Deploy the network policy to CloudWAN core network"""
     policy = get_network_policy(step)
     description = "CloudWAN network policy with segments and NFGs" if step == "initial" else "CloudWAN routing policy with segment actions"
     
     try:
         print(f"Deploying {step} network policy...")
-        response = networkmanager_client.put_core_network_policy(
+        policy_json = json.dumps(policy)
+        response = nm_client.put_core_network_policy(
             CoreNetworkId=core_network_id,
-            PolicyDocument=json.dumps(policy),
+            PolicyDocument=policy_json,
             Description=description
         )
         
         policy_version_id = response['CoreNetworkPolicy']['PolicyVersionId']
         print(f"✓ Policy created with version ID: {policy_version_id}")
         
-        # Execute the policy
+        # Wait for policy generation to complete
+        print("Waiting for policy generation to complete...")
+        if not wait_for_policy_generation(nm_client, core_network_id, policy_version_id):
+            return {'status': 'failed', 'error': 'Policy generation failed or timed out'}
+        
         print("Executing policy...")
-        execute_response = networkmanager_client.execute_core_network_change_set(
+        execute_response = nm_client.execute_core_network_change_set(
             CoreNetworkId=core_network_id,
             PolicyVersionId=policy_version_id
         )
         
         print("✓ Policy execution initiated")
-        
-        # Wait for policy to be executed
         print("Waiting for policy execution to complete...")
-        wait_for_policy_execution(networkmanager_client, core_network_id)
+        wait_for_policy_execution(nm_client, core_network_id)
         
         return {
             'status': 'success',
@@ -96,17 +106,56 @@ def deploy_network_policy(networkmanager_client, core_network_id: str, step: str
         }
         
     except Exception as e:
-        print(f"Error deploying network policy: {e}")
-        return {'status': 'failed', 'error': str(e)}
+        error_msg = str(e)
+        print(f"Error deploying network policy: {error_msg}")
+        # Try to get more details from the exception
+        if hasattr(e, 'response'):
+            error_details = e.response.get('Error', {})
+            if 'Message' in error_details:
+                print(f"Details: {error_details['Message']}")
+        return {'status': 'failed', 'error': error_msg}
 
 
-def wait_for_policy_execution(networkmanager_client, core_network_id: str, max_wait: int = 600):
+def wait_for_policy_generation(nm_client, core_network_id: str, policy_version_id: int, max_wait: int = 300):
+    """Wait for policy generation to complete before executing"""
+    start_time = time.time()
+    
+    while time.time() - start_time < max_wait:
+        try:
+            response = nm_client.get_core_network_policy(
+                CoreNetworkId=core_network_id,
+                PolicyVersionId=policy_version_id
+            )
+            state = response['CoreNetworkPolicy']['ChangeSetState']
+            
+            if state == 'READY_TO_EXECUTE':
+                print("✓ Policy generation completed")
+                return True
+            elif state == 'PENDING_GENERATION':
+                print(f"Policy generation in progress... (state: {state})")
+                time.sleep(10)
+            elif state == 'FAILED_GENERATION':
+                print(f"Policy generation failed")
+                return False
+            else:
+                print(f"Policy state: {state}")
+                time.sleep(10)
+                
+        except Exception as e:
+            print(f"Error checking policy generation status: {e}")
+            time.sleep(10)
+    
+    print("Timeout waiting for policy generation")
+    return False
+
+
+def wait_for_policy_execution(nm_client, core_network_id: str, max_wait: int = 600):
     """Wait for policy execution to complete"""
     start_time = time.time()
     
     while time.time() - start_time < max_wait:
         try:
-            response = networkmanager_client.get_core_network(CoreNetworkId=core_network_id)
+            response = nm_client.get_core_network(CoreNetworkId=core_network_id)
             state = response['CoreNetwork']['State']
             
             if state == 'AVAILABLE':
@@ -128,7 +177,7 @@ def wait_for_policy_execution(networkmanager_client, core_network_id: str, max_w
 
 
 def get_onprem_instance_ip(ec2_client) -> Optional[str]:
-    """Get the public IP of the onprem EC2 instance in eu-west-2"""
+    """Get the public IP of the onprem EC2 instance"""
     try:
         response = ec2_client.describe_instances(
             Filters=[
@@ -139,55 +188,40 @@ def get_onprem_instance_ip(ec2_client) -> Optional[str]:
         
         for reservation in response['Reservations']:
             for instance in reservation['Instances']:
-                public_ip = instance.get('PublicIpAddress')
-                if public_ip:
+                if public_ip := instance.get('PublicIpAddress'):
                     return public_ip
-        
         return None
-    
     except Exception as e:
         print(f"Error getting onprem instance IP: {e}")
         return None
 
 
 def create_site_to_site_vpn(ec2_client, onprem_ip: str) -> Dict[str, Any]:
-    """Create Site-to-Site VPN connection in Stockholm"""
+    """Create Site-to-Site VPN connection"""
     try:
         print(f"Creating Site-to-Site VPN with onprem IP: {onprem_ip}")
         
-        # Create customer gateway first
         cgw_response = ec2_client.create_customer_gateway(
             BgpAsn=64512,
             PublicIp=onprem_ip,
             Type='ipsec.1',
-            TagSpecifications=[
-                {
-                    'ResourceType': 'customer-gateway',
-                    'Tags': [
-                        {'Key': 'Name', 'Value': 'onpremises-cgw'}
-                    ]
-                }
-            ]
+            TagSpecifications=[{
+                'ResourceType': 'customer-gateway',
+                'Tags': [{'Key': 'Name', 'Value': 'onpremises-cgw'}]
+            }]
         )
         
         customer_gateway_id = cgw_response['CustomerGateway']['CustomerGatewayId']
         print(f"✓ Created customer gateway: {customer_gateway_id}")
         
-        # Create VPN connection
         vpn_response = ec2_client.create_vpn_connection(
             CustomerGatewayId=customer_gateway_id,
             Type='ipsec.1',
-            Options={
-                'StaticRoutesOnly': False  # Dynamic routing with BGP
-            },
-            TagSpecifications=[
-                {
-                    'ResourceType': 'vpn-connection',
-                    'Tags': [
-                        {'Key': 'Name', 'Value': 'onpremises'}
-                    ]
-                }
-            ]
+            Options={'StaticRoutesOnly': False},
+            TagSpecifications=[{
+                'ResourceType': 'vpn-connection',
+                'Tags': [{'Key': 'Name', 'Value': 'onpremises'}]
+            }]
         )
         
         vpn_connection_id = vpn_response['VpnConnection']['VpnConnectionId']
@@ -210,9 +244,7 @@ def wait_for_vpn_available(ec2_client, vpn_connection_id: str, max_wait: int = 3
     
     while time.time() - start_time < max_wait:
         try:
-            response = ec2_client.describe_vpn_connections(
-                VpnConnectionIds=[vpn_connection_id]
-            )
+            response = ec2_client.describe_vpn_connections(VpnConnectionIds=[vpn_connection_id])
             
             if response['VpnConnections']:
                 state = response['VpnConnections'][0]['State']
@@ -235,160 +267,121 @@ def wait_for_vpn_available(ec2_client, vpn_connection_id: str, max_wait: int = 3
     return False
 
 
-def get_core_network_arn(networkmanager_client, core_network_id: str) -> str:
-    """Get the ARN of the core network"""
-    try:
-        response = networkmanager_client.get_core_network(CoreNetworkId=core_network_id)
-        return response['CoreNetwork']['CoreNetworkArn']
-    except Exception as e:
-        print(f"Error getting core network ARN: {e}")
-        return ""
-
-
 def update_vpc_route_tables(session, core_network_id: str) -> List[Dict[str, Any]]:
     """Update VPC route tables to point to CloudWAN core network"""
-    
-    # Route table configurations per region
-    route_configs = {
-        "eu-north-1": [  # Stockholm
-            {"vpc_name": "VPC-prod", "route_table_name": "private", "destination": "0.0.0.0/0"},
-            {"vpc_name": "VPC-thirdparty", "route_table_name": "private", "destination": "0.0.0.0/0"},
-            {"vpc_name": "eastwest-inspection", "route_table_name": "firewall", "destination": "0.0.0.0/0"},
-            {"vpc_name": "egress-inspection", "route_table_name": "firewall", "destination": "10.0.0.0/8"},
-        ],
-        "us-west-2": [  # Oregon
-            {"vpc_name": "VPC-prod", "route_table_name": "private", "destination": "0.0.0.0/0"},
-            {"vpc_name": "VPC-thirdparty", "route_table_name": "private", "destination": "0.0.0.0/0"},
-            {"vpc_name": "eastwest-inspection", "route_table_name": "firewall", "destination": "0.0.0.0/0"},
-            {"vpc_name": "egress-inspection", "route_table_name": "firewall", "destination": "10.0.0.0/8"},
-        ]
-    }
-    
-    # Get core network ARN
-    networkmanager_client = session.client('networkmanager', region_name='us-west-2')
-    core_network_arn = get_core_network_arn(networkmanager_client, core_network_id)
-    
-    if not core_network_arn:
-        print("Failed to get core network ARN")
-        return []
-    
     results = []
+    account_id = get_account_id(session)
     
-    for region, configs in route_configs.items():
+    for region in REGION_MAP.values():
         print(f"\nUpdating route tables in {region}...")
         ec2_client = session.client('ec2', region_name=region)
         
-        for config in configs:
+        for config in ROUTE_CONFIGS:
             vpc_name = config["vpc_name"]
             route_table_name = config["route_table_name"]
             destination = config["destination"]
             
             print(f"Processing {vpc_name} - {route_table_name} route table...")
             
-            # Find VPC ID
             vpc_id = get_vpc_id_by_name(ec2_client, vpc_name)
             if not vpc_id:
+                print(f"  VPC not found: {vpc_name}")
                 results.append({
-                    'region': region,
-                    'vpc_name': vpc_name,
+                    'region': region, 'vpc_name': vpc_name,
                     'route_table_name': route_table_name,
                     'status': 'Failed - VPC not found'
                 })
                 continue
             
-            # Find route table IDs
+            print(f"  Found VPC: {vpc_id}")
             route_table_ids = get_route_table_ids(ec2_client, vpc_id, route_table_name)
             if not route_table_ids:
+                print(f"  No route tables found matching: {route_table_name}")
                 results.append({
-                    'region': region,
-                    'vpc_name': vpc_name,
+                    'region': region, 'vpc_name': vpc_name,
                     'route_table_name': route_table_name,
                     'status': 'Failed - Route table not found'
                 })
                 continue
             
-            # Update each route table
             for rt_id in route_table_ids:
-                success = update_route_table(ec2_client, rt_id, destination, core_network_id)
+                success = update_route_table(ec2_client, rt_id, destination, core_network_id, account_id)
                 results.append({
-                    'region': region,
-                    'vpc_name': vpc_name,
+                    'region': region, 'vpc_name': vpc_name,
                     'route_table_name': route_table_name,
-                    'route_table_id': rt_id,
-                    'destination': destination,
+                    'route_table_id': rt_id, 'destination': destination,
                     'status': 'Updated' if success else 'Failed'
                 })
-                
-                if success:
-                    print(f"✓ Updated route table {rt_id}")
-                else:
-                    print(f"✗ Failed to update route table {rt_id}")
+                print(f"{'✓' if success else '✗'} {'Updated' if success else 'Failed to update'} route table {rt_id}")
     
     return results
 
 
-def get_vpc_id_by_name(ec2_client, vpc_name: str) -> Optional[str]:
-    """Get VPC ID by name tag"""
+def get_vpc_id_by_name(ec2_client, vpc_name_pattern: str) -> Optional[str]:
+    """Get VPC ID by name tag pattern (supports wildcards with *)"""
+    import re
     try:
-        response = ec2_client.describe_vpcs(
-            Filters=[
-                {'Name': 'tag:Name', 'Values': [vpc_name]}
-            ]
-        )
+        response = ec2_client.describe_vpcs()
         
-        if response['Vpcs']:
-            return response['Vpcs'][0]['VpcId']
+        # Convert wildcard pattern to simple matching
+        pattern = vpc_name_pattern.replace('*', '.*')
+        regex = re.compile(f'^{pattern}$')
+        
+        for vpc in response['Vpcs']:
+            for tag in vpc.get('Tags', []):
+                if tag['Key'] == 'Name' and regex.match(tag['Value']):
+                    return vpc['VpcId']
         return None
-        
     except Exception as e:
-        print(f"Error finding VPC {vpc_name}: {e}")
+        print(f"Error finding VPC {vpc_name_pattern}: {e}")
         return None
 
 
-def get_route_table_ids(ec2_client, vpc_id: str, route_table_name: str) -> List[str]:
-    """Get route table IDs by VPC and name pattern"""
+def get_route_table_ids(ec2_client, vpc_id: str, route_table_name_pattern: str) -> List[str]:
+    """Get route table IDs by VPC and name pattern (supports wildcards)"""
+    import re
     try:
         response = ec2_client.describe_route_tables(
-            Filters=[
-                {'Name': 'vpc-id', 'Values': [vpc_id]},
-                {'Name': 'tag:Name', 'Values': [f'*{route_table_name}*']}
-            ]
+            Filters=[{'Name': 'vpc-id', 'Values': [vpc_id]}]
         )
         
-        return [rt['RouteTableId'] for rt in response['RouteTables']]
+        # Convert wildcard pattern to regex
+        pattern = route_table_name_pattern.replace('*', '.*')
+        regex = re.compile(f'^{pattern}$', re.IGNORECASE)
         
+        result = []
+        for rt in response['RouteTables']:
+            for tag in rt.get('Tags', []):
+                if tag['Key'] == 'Name' and regex.match(tag['Value']):
+                    result.append(rt['RouteTableId'])
+                    break
+        return result
     except Exception as e:
         print(f"Error finding route tables for VPC {vpc_id}: {e}")
         return []
 
 
-def update_route_table(ec2_client, route_table_id: str, destination: str, core_network_id: str) -> bool:
+def update_route_table(ec2_client, route_table_id: str, destination: str, core_network_id: str, account_id: str) -> bool:
     """Update a single route table with core network route"""
     try:
-        # Check if route already exists
         response = ec2_client.describe_route_tables(RouteTableIds=[route_table_id])
         existing_routes = response['RouteTables'][0]['Routes']
         
-        # Check if route to destination already exists
+        core_network_arn = f"arn:aws:networkmanager::{account_id}:core-network/{core_network_id}"
+        
         for route in existing_routes:
             if route.get('DestinationCidrBlock') == destination:
-                # Route exists, replace it
-                try:
-                    ec2_client.replace_route(
-                        RouteTableId=route_table_id,
-                        DestinationCidrBlock=destination,
-                        CoreNetworkArn=f"arn:aws:networkmanager::*:core-network/{core_network_id}"
-                    )
-                    return True
-                except Exception as e:
-                    print(f"Error replacing route: {e}")
-                    return False
+                ec2_client.replace_route(
+                    RouteTableId=route_table_id,
+                    DestinationCidrBlock=destination,
+                    CoreNetworkArn=core_network_arn
+                )
+                return True
         
-        # Route doesn't exist, create it
         ec2_client.create_route(
             RouteTableId=route_table_id,
             DestinationCidrBlock=destination,
-            CoreNetworkArn=f"arn:aws:networkmanager::*:core-network/{core_network_id}"
+            CoreNetworkArn=core_network_arn
         )
         return True
         
@@ -397,56 +390,39 @@ def update_route_table(ec2_client, route_table_id: str, destination: str, core_n
         return False
 
 
-def get_vpn_connections(ec2_client, region: str) -> List[Dict[str, str]]:
+def get_vpn_connections(ec2_client) -> List[Dict[str, str]]:
     """Get available VPN connections in the region"""
     try:
         response = ec2_client.describe_vpn_connections(
-            Filters=[
-                {'Name': 'state', 'Values': ['available']}
-            ]
+            Filters=[{'Name': 'state', 'Values': ['available']}]
         )
-        
-        vpn_connections = []
-        for vpn in response['VpnConnections']:
-            vpn_connections.append({
-                'VpnConnectionId': vpn['VpnConnectionId'],
-                'State': vpn['State']
-            })
-        
-        return vpn_connections
-    
+        return [{'VpnConnectionId': vpn['VpnConnectionId'], 'State': vpn['State']} 
+                for vpn in response['VpnConnections']]
     except Exception as e:
-        print(f"Warning: Could not fetch VPN connections in {region}: {e}")
+        print(f"Warning: Could not fetch VPN connections: {e}")
         return []
 
 
-def create_cloudwan_vpn_attachment(networkmanager_client, core_network_id: str, config: VPNAttachmentConfig, vpn_id: str) -> Dict[str, Any]:
+def create_cloudwan_vpn_attachment(nm_client, core_network_id: str, config: VPNAttachmentConfig, 
+                                    vpn_id: str, account_id: str) -> Dict[str, Any]:
     """Create a CloudWAN VPN attachment"""
-    
-    # Get account ID from STS
-    sts_client = networkmanager_client._client_config.__dict__.get('_user_provided_options', {}).get('region_name', 'us-west-2')
-    sts = boto3.client('sts', region_name=sts_client if isinstance(sts_client, str) else 'us-west-2')
-    account_id = sts.get_caller_identity()['Account']
-    
-    attachment_params = {
-        'CoreNetworkId': core_network_id,
-        'VpnConnectionArn': f"arn:aws:ec2:{config.edge_location}:{account_id}:vpn-connection/{vpn_id}",
-        'Tags': {
-            config.tag_key: config.tag_value,
-            'Name': config.name
-        }
-    }
-    
     try:
-        response = networkmanager_client.create_site_to_site_vpn_attachment(**attachment_params)
+        response = nm_client.create_site_to_site_vpn_attachment(
+            CoreNetworkId=core_network_id,
+            VpnConnectionArn=f"arn:aws:ec2:{config.edge_location}:{account_id}:vpn-connection/{vpn_id}",
+            Tags=[
+                {'Key': config.tag_key, 'Value': config.tag_value},
+                {'Key': 'Name', 'Value': config.name}
+            ]
+        )
         return response
     except Exception as e:
         print(f"Error creating VPN attachment {config.name}: {e}")
         return {}
 
 
-def get_subnets_for_vpc(ec2_client, vpc_id: str, strategy: str = "CWAN in each AZ") -> List[str]:
-    """Get subnet IDs for a VPC based on the strategy"""
+def get_subnets_for_vpc(ec2_client, vpc_id: str) -> List[str]:
+    """Get CWAN subnet IDs for a VPC, one per AZ"""
     try:
         response = ec2_client.describe_subnets(
             Filters=[
@@ -455,7 +431,6 @@ def get_subnets_for_vpc(ec2_client, vpc_id: str, strategy: str = "CWAN in each A
             ]
         )
         
-        # Group by AZ and take one subnet per AZ
         az_subnets = {}
         for subnet in response['Subnets']:
             az = subnet['AvailabilityZone']
@@ -463,32 +438,31 @@ def get_subnets_for_vpc(ec2_client, vpc_id: str, strategy: str = "CWAN in each A
                 az_subnets[az] = subnet['SubnetId']
         
         return list(az_subnets.values())
-    
     except Exception as e:
         print(f"Warning: Could not fetch subnets for {vpc_id}: {e}")
         return []
 
 
-def create_cloudwan_attachment(networkmanager_client, core_network_id: str, config: AttachmentConfig, subnet_ids: List[str]) -> Dict[str, Any]:
+def create_cloudwan_attachment(nm_client, core_network_id: str, config: AttachmentConfig, 
+                                subnet_ids: List[str], account_id: str) -> Dict[str, Any]:
     """Create a CloudWAN VPC attachment"""
+    region = REGION_MAP[config.edge_location]
     
-    attachment_params = {
+    params = {
         'CoreNetworkId': core_network_id,
-        'VpcArn': f"arn:aws:ec2:{config.edge_location}:{{account_id}}:vpc/{config.vpc_id}",
-        'SubnetArns': [f"arn:aws:ec2:{config.edge_location}:{{account_id}}:subnet/{subnet_id}" for subnet_id in subnet_ids],
-        'Tags': {
-            config.tag_key: config.tag_value,
-            'Name': config.name
-        }
+        'VpcArn': f"arn:aws:ec2:{region}:{account_id}:vpc/{config.vpc_id}",
+        'SubnetArns': [f"arn:aws:ec2:{region}:{account_id}:subnet/{sid}" for sid in subnet_ids],
+        'Tags': [
+            {'Key': config.tag_key, 'Value': config.tag_value},
+            {'Key': 'Name', 'Value': config.name}
+        ]
     }
     
-    # Add appliance mode if specified
-    if config.appliance_mode.lower() == 'enable':
-        attachment_params['Options'] = {'ApplianceModeSupport': True}
+    if config.appliance_mode:
+        params['Options'] = {'ApplianceModeSupport': True}
     
     try:
-        response = networkmanager_client.create_vpc_attachment(**attachment_params)
-        return response
+        return nm_client.create_vpc_attachment(**params)
     except Exception as e:
         print(f"Error creating attachment {config.name}: {e}")
         return {}
@@ -496,194 +470,194 @@ def create_cloudwan_attachment(networkmanager_client, core_network_id: str, conf
 
 def create_all_attachments(session, core_network_id: str) -> List[Dict[str, Any]]:
     """Create all VPC and VPN attachments"""
-    # Configuration for all attachments
+    account_id = get_account_id(session)
+    nm_client = session.client('networkmanager', region_name='us-west-2')
+    
     attachments_config = [
-        # Stockholm Region
-        AttachmentConfig("stockholm-prod", "stockholm", "VPC", "", "VPC-prod", "CWAN in each AZ", "domain", "prod"),
-        AttachmentConfig("stockholm-thirdparty", "stockholm", "VPC", "", "VPC-thirdparty", "CWAN in each AZ", "domain", "thirdparty"),
-        AttachmentConfig("stockholm-eastwestinspection", "stockholm", "VPC", "Enable", "eastwest-inspection", "CWAN in each AZ", "nfg", "eastwestinspection"),
-        AttachmentConfig("stockholm-egressinspection", "stockholm", "VPC", "Enable", "egress-inspection", "CWAN in each AZ", "nfg", "egressinspection"),
-        
-        # Oregon Region
-        AttachmentConfig("oregon-prod", "oregon", "VPC", "", "VPC-prod", "CWAN in each AZ", "domain", "prod"),
-        AttachmentConfig("oregon-thirdparty", "oregon", "VPC", "", "VPC-thirdparty", "CWAN in each AZ", "domain", "thirdparty"),
-        AttachmentConfig("oregon-eastwestinspection", "oregon", "VPC", "Enable", "eastwest-inspection", "CWAN in each AZ", "nfg", "eastwestinspection"),
-        AttachmentConfig("oregon-egressinspection", "oregon", "VPC", "Enable", "egress-inspection", "CWAN in each AZ", "nfg", "egressinspection"),
+        # Stockholm
+        AttachmentConfig("stockholm-prod", "stockholm", False, "VPC-prod", "domain", "prod"),
+        AttachmentConfig("stockholm-thirdparty", "stockholm", False, "VPC-thirdparty", "domain", "thirdparty"),
+        AttachmentConfig("stockholm-eastwestinspection", "stockholm", True, "eastwest-inspection", "nfg", "eastwestinspection"),
+        AttachmentConfig("stockholm-egressinspection", "stockholm", True, "egress-inspection", "nfg", "egressinspection"),
+        # Oregon
+        AttachmentConfig("oregon-prod", "oregon", False, "VPC-prod", "domain", "prod"),
+        AttachmentConfig("oregon-thirdparty", "oregon", False, "VPC-thirdparty", "domain", "thirdparty"),
+        AttachmentConfig("oregon-eastwestinspection", "oregon", True, "eastwest-inspection", "nfg", "eastwestinspection"),
+        AttachmentConfig("oregon-egressinspection", "oregon", True, "egress-inspection", "nfg", "egressinspection"),
     ]
     
-    # VPN Attachments configuration
     vpn_attachments_config = [
-        VPNAttachmentConfig("stockholm-onpremises-vpn", "eu-north-1", "VPN", "", "domain", "onpremises"),
+        VPNAttachmentConfig("stockholm-onpremises-vpn", "eu-north-1", "domain", "onpremises"),
     ]
-    
-    # Region mapping
-    region_mapping = {
-        "stockholm": "eu-north-1",
-        "oregon": "us-west-2"
-    }
     
     results = []
     
     # Process VPC attachments
     for config in attachments_config:
-        region = region_mapping[config.edge_location]
+        region = REGION_MAP[config.edge_location]
         print(f"\nProcessing {config.name} in {region}...")
         
-        # Initialize clients for the region using the session
         ec2_client = session.client('ec2', region_name=region)
-        networkmanager_client = session.client('networkmanager', region_name='us-west-2')  # Global service
-        
-        # Get subnet IDs
-        subnet_ids = get_subnets_for_vpc(ec2_client, config.vpc_id, config.subnet_strategy)
+        subnet_ids = get_subnets_for_vpc(ec2_client, config.vpc_id)
         
         if not subnet_ids:
             print(f"Warning: No subnets found for {config.vpc_id} in {region}")
+            results.append({'name': config.name, 'region': region, 'status': 'Failed - No subnets'})
             continue
         
         print(f"Found {len(subnet_ids)} subnets: {subnet_ids}")
-        
-        # Create the attachment
-        result = create_cloudwan_attachment(networkmanager_client, core_network_id, config, subnet_ids)
+        result = create_cloudwan_attachment(nm_client, core_network_id, config, subnet_ids, account_id)
         
         if result:
-            results.append({
-                'name': config.name,
-                'region': region,
-                'attachment_id': result.get('VpcAttachment', {}).get('AttachmentId'),
-                'status': 'Created'
-            })
-            print(f"✓ Created attachment: {result.get('VpcAttachment', {}).get('AttachmentId')}")
+            attachment_id = result.get('VpcAttachment', {}).get('AttachmentId')
+            results.append({'name': config.name, 'region': region, 'attachment_id': attachment_id, 'status': 'Created'})
+            print(f"✓ Created attachment: {attachment_id}")
         else:
-            results.append({
-                'name': config.name,
-                'region': region,
-                'status': 'Failed'
-            })
+            results.append({'name': config.name, 'region': region, 'status': 'Failed'})
     
     # Process VPN attachments
     for vpn_config in vpn_attachments_config:
         region = vpn_config.edge_location
         print(f"\nProcessing VPN attachment {vpn_config.name} in {region}...")
         
-        # Initialize clients for the region using the session
         ec2_client = session.client('ec2', region_name=region)
-        networkmanager_client = session.client('networkmanager', region_name='us-west-2')  # Global service
-        
-        # Get available VPN connections
-        vpn_connections = get_vpn_connections(ec2_client, region)
+        vpn_connections = get_vpn_connections(ec2_client)
         
         if not vpn_connections:
             print(f"Warning: No VPN connections found in {region}")
-            results.append({
-                'name': vpn_config.name,
-                'region': region,
-                'status': 'Failed - No VPN found'
-            })
+            results.append({'name': vpn_config.name, 'region': region, 'status': 'Failed - No VPN found'})
             continue
         
-        # Use the first available VPN connection
         vpn_id = vpn_connections[0]['VpnConnectionId']
         print(f"Using VPN connection: {vpn_id}")
         
-        # Create the VPN attachment
-        result = create_cloudwan_vpn_attachment(networkmanager_client, core_network_id, vpn_config, vpn_id)
+        result = create_cloudwan_vpn_attachment(nm_client, core_network_id, vpn_config, vpn_id, account_id)
         
         if result:
-            results.append({
-                'name': vpn_config.name,
-                'region': region,
-                'attachment_id': result.get('SiteToSiteVpnAttachment', {}).get('AttachmentId'),
-                'vpn_id': vpn_id,
-                'status': 'Created'
-            })
-            print(f"✓ Created VPN attachment: {result.get('SiteToSiteVpnAttachment', {}).get('AttachmentId')}")
+            attachment_id = result.get('SiteToSiteVpnAttachment', {}).get('AttachmentId')
+            results.append({'name': vpn_config.name, 'region': region, 'attachment_id': attachment_id, 
+                           'vpn_id': vpn_id, 'status': 'Created'})
+            print(f"✓ Created VPN attachment: {attachment_id}")
         else:
-            results.append({
-                'name': vpn_config.name,
-                'region': region,
-                'vpn_id': vpn_id,
-                'status': 'Failed'
-            })
+            results.append({'name': vpn_config.name, 'region': region, 'vpn_id': vpn_id, 'status': 'Failed'})
     
     return results
 
 
+def load_env_file(env_file: str) -> Dict[str, str]:
+    """Load AWS credentials from .env file"""
+    creds = {}
+    try:
+        with open(env_file, 'r') as f:
+            for line in f:
+                line = line.strip()
+                if line and '=' in line and not line.startswith('#'):
+                    key, value = line.split('=', 1)
+                    # Remove quotes if present
+                    value = value.strip().strip('"').strip("'")
+                    creds[key] = value
+        return creds
+    except FileNotFoundError:
+        print(f"Error: {env_file} not found")
+        sys.exit(1)
+
+
+def extract_core_network_id(value: str) -> str:
+    """Extract core network ID from ARN or return as-is if already an ID"""
+    if value.startswith('arn:aws:networkmanager'):
+        # Extract the ID from ARN like: arn:aws:networkmanager::522814688295:core-network/core-network-0848a6df024911780
+        parts = value.split('/')
+        if len(parts) >= 2:
+            return parts[-1]
+    return value
+
+
 def main():
-    # Parse command line arguments
     parser = argparse.ArgumentParser(description='Deploy CloudWAN infrastructure')
-    parser.add_argument('--aws-access-key-id', required=True, help='AWS Access Key ID')
-    parser.add_argument('--aws-secret-access-key', required=True, help='AWS Secret Access Key')
-    parser.add_argument('--core-network-id', required=True, help='CloudWAN Core Network ID')
+    parser.add_argument('--aws-access-key-id', help='AWS Access Key ID')
+    parser.add_argument('--aws-secret-access-key', help='AWS Secret Access Key')
     parser.add_argument('--aws-session-token', help='AWS Session Token (optional)')
-    parser.add_argument('--step', choices=['policy', 'vpn', 'attachments', 'routing', 'routes', 'all'], default='all',
-                       help='Deployment step to execute (default: all)')
+    parser.add_argument('--env-file', help='Path to .env file with AWS credentials')
+    parser.add_argument('--core-network-id', required=True, help='CloudWAN Core Network ID or ARN')
+    parser.add_argument('--step', choices=['2-update-core-network-policy', '3-configure-site-to-site-vpn', 
+                                          '4-create-attachments', '5-update-core-network-policy-for-routing', 
+                                          '7-update-vpc-route-tables', 'all'], 
+                       default='all', help='Deployment step to execute (default: all)')
     
     args = parser.parse_args()
     
-    # Validate required arguments
-    if not args.aws_access_key_id or not args.aws_secret_access_key or not args.core_network_id:
-        print("Error: Missing required arguments")
+    # Extract core network ID from ARN if needed
+    args.core_network_id = extract_core_network_id(args.core_network_id)
+    
+    # Load credentials from env file or command line
+    if args.env_file:
+        creds = load_env_file(args.env_file)
+        access_key = creds.get('AWS_ACCESS_KEY_ID')
+        secret_key = creds.get('AWS_SECRET_ACCESS_KEY')
+        session_token = creds.get('AWS_SESSION_TOKEN')
+    else:
+        access_key = args.aws_access_key_id
+        secret_key = args.aws_secret_access_key
+        session_token = args.aws_session_token
+    
+    if not access_key or not secret_key:
+        print("Error: AWS credentials required. Use --env-file or --aws-access-key-id/--aws-secret-access-key")
         parser.print_help()
         sys.exit(1)
     
-    # Configure AWS credentials
     session = boto3.Session(
-        aws_access_key_id=args.aws_access_key_id,
-        aws_secret_access_key=args.aws_secret_access_key,
-        aws_session_token=args.aws_session_token
+        aws_access_key_id=access_key,
+        aws_secret_access_key=secret_key,
+        aws_session_token=session_token
     )
     
     print(f"Using Core Network ID: {args.core_network_id}")
     print(f"Executing step: {args.step}")
     
     results = {'steps_completed': [], 'errors': []}
+    nm_client = session.client('networkmanager', region_name='us-west-2')
     
-    # Step 1: Deploy Network Policy
-    if args.step in ['policy', 'all']:
+    # Step 2: Update Core Network Policy
+    if args.step in ['2-update-core-network-policy', 'all']:
         print("\n" + "="*50)
-        print("STEP 1: DEPLOYING NETWORK POLICY")
+        print("STEP 2: UPDATE CORE NETWORK POLICY")
         print("="*50)
         
-        networkmanager_client = session.client('networkmanager', region_name='us-west-2')
-        policy_result = deploy_network_policy(networkmanager_client, args.core_network_id)
+        policy_result = deploy_network_policy(nm_client, args.core_network_id)
         
         if policy_result['status'] == 'success':
-            results['steps_completed'].append('policy')
+            results['steps_completed'].append('2-update-core-network-policy')
             print("✓ Network policy deployment completed")
         else:
             results['errors'].append(f"Policy deployment failed: {policy_result.get('error')}")
             print("✗ Network policy deployment failed")
-            if args.step == 'policy':
+            if args.step == '2-update-core-network-policy':
                 sys.exit(1)
     
-    # Step 2: Create Site-to-Site VPN
-    if args.step in ['vpn', 'all']:
+    # Step 3: Configure Site-to-Site VPN
+    if args.step in ['3-configure-site-to-site-vpn', 'all']:
         print("\n" + "="*50)
-        print("STEP 2: CREATING SITE-TO-SITE VPN")
+        print("STEP 3: CONFIGURE SITE-TO-SITE VPN")
         print("="*50)
         
-        # Get onprem instance IP from London region
-        london_ec2_client = session.client('ec2', region_name='eu-west-2')
-        onprem_ip = get_onprem_instance_ip(london_ec2_client)
+        london_ec2 = session.client('ec2', region_name='eu-west-2')
+        onprem_ip = get_onprem_instance_ip(london_ec2)
         
         if not onprem_ip:
-            error_msg = "Could not find onprem instance IP in eu-west-2"
-            results['errors'].append(error_msg)
-            print(f"✗ {error_msg}")
-            if args.step == 'vpn':
+            results['errors'].append("Could not find onprem instance IP in eu-west-2")
+            print("✗ Could not find onprem instance IP in eu-west-2")
+            if args.step == '3-configure-site-to-site-vpn':
                 sys.exit(1)
         else:
             print(f"Found onprem instance IP: {onprem_ip}")
             
-            # Create VPN in Stockholm region
-            stockholm_ec2_client = session.client('ec2', region_name='eu-north-1')
-            vpn_result = create_site_to_site_vpn(stockholm_ec2_client, onprem_ip)
+            stockholm_ec2 = session.client('ec2', region_name='eu-north-1')
+            vpn_result = create_site_to_site_vpn(stockholm_ec2, onprem_ip)
             
             if vpn_result['status'] == 'success':
-                # Wait for VPN to become available
                 vpn_id = vpn_result['vpn_connection_id']
-                if wait_for_vpn_available(stockholm_ec2_client, vpn_id):
-                    results['steps_completed'].append('vpn')
+                if wait_for_vpn_available(stockholm_ec2, vpn_id):
+                    results['steps_completed'].append('3-configure-site-to-site-vpn')
                     results['vpn_connection_id'] = vpn_id
                     print("✓ Site-to-Site VPN creation completed")
                 else:
@@ -692,69 +666,66 @@ def main():
             else:
                 results['errors'].append(f"VPN creation failed: {vpn_result.get('error')}")
                 print("✗ Site-to-Site VPN creation failed")
-                if args.step == 'vpn':
+                if args.step == '3-configure-site-to-site-vpn':
                     sys.exit(1)
     
-    # Step 3: Create Attachments
-    if args.step in ['attachments', 'all']:
+    # Step 4: Create Attachments
+    if args.step in ['4-create-attachments', 'all']:
         print("\n" + "="*50)
-        print("STEP 3: CREATING ATTACHMENTS")
+        print("STEP 4: CREATE ATTACHMENTS")
         print("="*50)
         
         attachment_results = create_all_attachments(session, args.core_network_id)
         
         if attachment_results:
-            results['steps_completed'].append('attachments')
+            results['steps_completed'].append('4-create-attachments')
             results['attachments'] = attachment_results
             print("✓ Attachment creation completed")
         else:
             results['errors'].append("Attachment creation failed")
             print("✗ Attachment creation failed")
     
-    # Step 4: Update Core Network Policy for Routing
-    if args.step in ['routing', 'all']:
+    # Step 5: Update Core Network Policy for Routing
+    if args.step in ['5-update-core-network-policy-for-routing', 'all']:
         print("\n" + "="*50)
-        print("STEP 4: UPDATING CORE NETWORK POLICY FOR ROUTING")
+        print("STEP 5: UPDATE CORE NETWORK POLICY FOR ROUTING")
         print("="*50)
         
-        networkmanager_client = session.client('networkmanager', region_name='us-west-2')
-        routing_policy_result = deploy_network_policy(networkmanager_client, args.core_network_id, "routing")
+        routing_result = deploy_network_policy(nm_client, args.core_network_id, "routing")
         
-        if routing_policy_result['status'] == 'success':
-            results['steps_completed'].append('routing')
-            results['routing_policy_version_id'] = routing_policy_result['policy_version_id']
+        if routing_result['status'] == 'success':
+            results['steps_completed'].append('5-update-core-network-policy-for-routing')
+            results['routing_policy_version_id'] = routing_result['policy_version_id']
             print("✓ Routing policy deployment completed")
         else:
-            results['errors'].append(f"Routing policy deployment failed: {routing_policy_result.get('error')}")
+            results['errors'].append(f"Routing policy deployment failed: {routing_result.get('error')}")
             print("✗ Routing policy deployment failed")
-            if args.step == 'routing':
+            if args.step == '5-update-core-network-policy-for-routing':
                 sys.exit(1)
     
-    # Step 5: Update VPC Route Tables
-    if args.step in ['routes', 'all']:
+    # Step 7: Update VPC Route Tables
+    if args.step in ['7-update-vpc-route-tables', 'all']:
         print("\n" + "="*50)
-        print("STEP 5: UPDATING VPC ROUTE TABLES")
+        print("STEP 7: UPDATE VPC ROUTE TABLES")
         print("="*50)
         
         route_results = update_vpc_route_tables(session, args.core_network_id)
         
         if route_results:
-            results['steps_completed'].append('routes')
+            results['steps_completed'].append('7-update-vpc-route-tables')
             results['route_updates'] = route_results
             
-            # Count successes and failures
-            successful_updates = len([r for r in route_results if r['status'] == 'Updated'])
-            total_updates = len(route_results)
+            successful = len([r for r in route_results if r['status'] == 'Updated'])
+            total = len(route_results)
             
-            print(f"✓ Route table updates completed: {successful_updates}/{total_updates} successful")
+            print(f"✓ Route table updates completed: {successful}/{total} successful")
             
-            if successful_updates < total_updates:
-                failed_updates = total_updates - successful_updates
-                results['errors'].append(f"{failed_updates} route table updates failed")
+            if successful < total:
+                results['errors'].append(f"{total - successful} route table updates failed")
         else:
             results['errors'].append("Route table update failed")
             print("✗ Route table update failed")
-            if args.step == 'routes':
+            if args.step == '7-update-vpc-route-tables':
                 sys.exit(1)
     
     # Final Summary
@@ -768,7 +739,6 @@ def main():
         for error in results['errors']:
             print(f"  - {error}")
     
-    # Save results to file
     with open('cloudwan_deployment_results.json', 'w') as f:
         json.dump(results, f, indent=2)
     
