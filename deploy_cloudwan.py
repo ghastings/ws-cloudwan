@@ -54,7 +54,7 @@ def get_account_id(session) -> str:
 
 def get_network_policy(step: str = "initial") -> Dict[str, Any]:
     """Load the CloudWAN network policy from JSON file"""
-    filename = 'step1-cnp.json' if step == "initial" else 'step4-routing-cnp.json'
+    filename = 'step2-cnp.json' if step == "initial" else 'step5-routing-cnp.json'
     
     try:
         with open(filename, 'r') as f:
