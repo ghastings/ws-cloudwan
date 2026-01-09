@@ -1,0 +1,27 @@
+# Secrets and credentials
+*.env
+secret.env
+
+# Deployment results
+cloudwan_deployment_results.json
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+venv/
+env/
+ENV/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
+Thumbs.db
