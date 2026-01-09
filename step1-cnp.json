@@ -1,0 +1,83 @@
+{
+  "core-network-configuration": {
+    "vpn-ecmp-support": false,
+    "asn-ranges": ["64520-65525"],
+    "edge-locations": [
+      {"location": "eu-north-1"},
+      {"location": "us-west-2"}
+    ]
+  },
+  "version": "2021.12",
+  "network-function-groups": [
+    {
+      "name": "EgressInspectionVpcs",
+      "require-attachment-acceptance": false
+    },
+    {
+      "name": "EastwestInspectionVpcs",
+      "require-attachment-acceptance": false
+    }
+  ],
+  "segments": [
+    {
+      "name": "prod",
+      "require-attachment-acceptance": true,
+      "edge-locations": ["eu-north-1", "us-west-2"]
+    },
+    {
+      "name": "thirdparty",
+      "require-attachment-acceptance": false,
+      "edge-locations": ["eu-north-1", "us-west-2"]
+    },
+    {
+      "name": "onpremises",
+      "require-attachment-acceptance": false
+    }
+  ],
+  "attachment-policies": [
+    {
+      "rule-number": 100,
+      "condition-logic": "or",
+      "conditions": [
+        {
+          "type": "tag-value",
+          "operator": "equals",
+          "key": "nfg",
+          "value": "eastwestinspection"
+        }
+      ],
+      "action": {
+        "add-to-network-function-group": "EastwestInspectionVpcs"
+      }
+    },
+    {
+      "rule-number": 200,
+      "condition-logic": "or",
+      "conditions": [
+        {
+          "type": "tag-value",
+          "operator": "equals",
+          "key": "nfg",
+          "value": "egressinspection"
+        }
+      ],
+      "action": {
+        "add-to-network-function-group": "EgressInspectionVpcs"
+      }
+    },
+    {
+      "rule-number": 300,
+      "condition-logic": "or",
+      "conditions": [
+        {
+          "type": "tag-exists",
+          "key": "domain"
+        }
+      ],
+      "action": {
+        "association-method": "tag",
+        "tag-value-of-key": "domain"
+      }
+    }
+  ]
+}

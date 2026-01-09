@@ -1,0 +1,133 @@
+{
+  "core-network-configuration": {
+    "vpn-ecmp-support": false,
+    "asn-ranges": ["64520-65525"],
+    "edge-locations": [
+      {"location": "eu-north-1"},
+      {"location": "us-west-2"}
+    ]
+  },
+  "version": "2021.12",
+  "network-function-groups": [
+    {
+      "name": "EgressInspectionVpcs",
+      "require-attachment-acceptance": false
+    },
+    {
+      "name": "EastwestInspectionVpcs",
+      "require-attachment-acceptance": false
+    }
+  ],
+  "segments": [
+    {
+      "name": "prod",
+      "require-attachment-acceptance": true,
+      "edge-locations": ["eu-north-1", "us-west-2"]
+    },
+    {
+      "name": "thirdparty",
+      "require-attachment-acceptance": false,
+      "edge-locations": ["eu-north-1", "us-west-2"],
+      "isolate-attachments": true
+    },
+    {
+      "name": "onpremises",
+      "require-attachment-acceptance": false
+    }
+  ],
+  "segment-actions": [
+    {
+      "action": "share",
+      "mode": "attachment-route",
+      "segment": "onpremises",
+      "share-with": ["prod"],
+      "description": "Task 1: Allow traffic between onpremises and prod segments"
+    },
+    {
+      "action": "share",
+      "mode": "attachment-route", 
+      "segment": "prod",
+      "share-with": ["onpremises"],
+      "description": "Task 1: Allow traffic between prod and onpremises segments"
+    },
+    {
+      "action": "send-to",
+      "segment": "prod",
+      "destination-cidr-blocks": ["0.0.0.0/0"],
+      "via": {
+        "network-function-groups": ["EgressInspectionVpcs"]
+      },
+      "description": "Task 2: Inspect egress traffic from prod to Internet via Egress Inspection VPCs"
+    },
+    {
+      "action": "send-via",
+      "mode": "dual-hop",
+      "segment": "prod",
+      "via": {
+        "network-function-groups": ["EastwestInspectionVpcs"]
+      },
+      "when-sent-to": {
+        "segments": ["thirdparty"]
+      },
+      "description": "Task 3: Inspect traffic between prod and thirdparty segments via Eastwest Inspection VPCs (dual-hop for inter-region)"
+    },
+    {
+      "action": "send-via",
+      "mode": "dual-hop",
+      "segment": "thirdparty",
+      "via": {
+        "network-function-groups": ["EastwestInspectionVpcs"]
+      },
+      "when-sent-to": {
+        "segments": ["prod"]
+      },
+      "description": "Task 3: Inspect traffic between thirdparty and prod segments via Eastwest Inspection VPCs (dual-hop for inter-region)"
+    }
+  ],
+  "attachment-policies": [
+    {
+      "rule-number": 100,
+      "condition-logic": "or",
+      "conditions": [
+        {
+          "type": "tag-value",
+          "operator": "equals",
+          "key": "nfg",
+          "value": "eastwestinspection"
+        }
+      ],
+      "action": {
+        "add-to-network-function-group": "EastwestInspectionVpcs"
+      }
+    },
+    {
+      "rule-number": 200,
+      "condition-logic": "or",
+      "conditions": [
+        {
+          "type": "tag-value",
+          "operator": "equals",
+          "key": "nfg",
+          "value": "egressinspection"
+        }
+      ],
+      "action": {
+        "add-to-network-function-group": "EgressInspectionVpcs"
+      }
+    },
+    {
+      "rule-number": 300,
+      "condition-logic": "or",
+      "conditions": [
+        {
+          "type": "tag-exists",
+          "key": "domain"
+        }
+      ],
+      "action": {
+        "association-method": "tag",
+        "tag-value-of-key": "domain"
+      }
+    }
+  ]
+}
