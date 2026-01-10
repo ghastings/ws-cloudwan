@@ -1,104 +1,62 @@
 {
   "steps_completed": [
-    "7-update-vpc-route-tables"
+    "4-create-attachments"
   ],
   "errors": [],
-  "route_updates": [
+  "attachments": [
     {
+      "name": "stockholm-prod",
       "region": "eu-north-1",
-      "vpc_name": "prod-vpc-*",
-      "route_table_name": "*Private*",
-      "route_table_id": "rtb-05df8d08a8aa57df2",
-      "destination": "0.0.0.0/0",
-      "status": "Updated"
+      "attachment_id": null,
+      "status": "Created"
     },
     {
+      "name": "stockholm-thirdparty",
       "region": "eu-north-1",
-      "vpc_name": "thirdparty-vpc-*",
-      "route_table_name": "*Private*",
-      "route_table_id": "rtb-0b603ca89a8743aba",
-      "destination": "0.0.0.0/0",
-      "status": "Updated"
+      "attachment_id": null,
+      "status": "Created"
     },
     {
+      "name": "stockholm-eastwestinspection",
       "region": "eu-north-1",
-      "vpc_name": "eastwest-inspection-vpc-*",
-      "route_table_name": "*Firewall*",
-      "route_table_id": "rtb-0c439e9ef523cd483",
-      "destination": "0.0.0.0/0",
-      "status": "Updated"
+      "attachment_id": null,
+      "status": "Created"
     },
     {
+      "name": "stockholm-egressinspection",
       "region": "eu-north-1",
-      "vpc_name": "eastwest-inspection-vpc-*",
-      "route_table_name": "*Firewall*",
-      "route_table_id": "rtb-00672b9263b65b219",
-      "destination": "0.0.0.0/0",
-      "status": "Updated"
+      "attachment_id": null,
+      "status": "Created"
     },
     {
+      "name": "oregon-prod",
+      "region": "us-west-2",
+      "attachment_id": null,
+      "status": "Created"
+    },
+    {
+      "name": "oregon-thirdparty",
+      "region": "us-west-2",
+      "attachment_id": null,
+      "status": "Created"
+    },
+    {
+      "name": "oregon-eastwestinspection",
+      "region": "us-west-2",
+      "attachment_id": null,
+      "status": "Created"
+    },
+    {
+      "name": "oregon-egressinspection",
+      "region": "us-west-2",
+      "attachment_id": null,
+      "status": "Created"
+    },
+    {
+      "name": "stockholm-onpremises-vpn",
       "region": "eu-north-1",
-      "vpc_name": "egress-inspection-vpc-*",
-      "route_table_name": "*Firewall*",
-      "route_table_id": "rtb-07982d67fd127e137",
-      "destination": "10.0.0.0/8",
-      "status": "Updated"
-    },
-    {
-      "region": "eu-north-1",
-      "vpc_name": "egress-inspection-vpc-*",
-      "route_table_name": "*Firewall*",
-      "route_table_id": "rtb-00c86fb45719d4e6d",
-      "destination": "10.0.0.0/8",
-      "status": "Updated"
-    },
-    {
-      "region": "us-west-2",
-      "vpc_name": "prod-vpc-*",
-      "route_table_name": "*Private*",
-      "route_table_id": "rtb-0beb841e910b277f1",
-      "destination": "0.0.0.0/0",
-      "status": "Updated"
-    },
-    {
-      "region": "us-west-2",
-      "vpc_name": "thirdparty-vpc-*",
-      "route_table_name": "*Private*",
-      "route_table_id": "rtb-049a37b88b849fcf1",
-      "destination": "0.0.0.0/0",
-      "status": "Updated"
-    },
-    {
-      "region": "us-west-2",
-      "vpc_name": "eastwest-inspection-vpc-*",
-      "route_table_name": "*Firewall*",
-      "route_table_id": "rtb-0e6bf06bb303e7f25",
-      "destination": "0.0.0.0/0",
-      "status": "Updated"
-    },
-    {
-      "region": "us-west-2",
-      "vpc_name": "eastwest-inspection-vpc-*",
-      "route_table_name": "*Firewall*",
-      "route_table_id": "rtb-0f1150002b4a17fb1",
-      "destination": "0.0.0.0/0",
-      "status": "Updated"
-    },
-    {
-      "region": "us-west-2",
-      "vpc_name": "egress-inspection-vpc-*",
-      "route_table_name": "*Firewall*",
-      "route_table_id": "rtb-0341b71ca1cb614e7",
-      "destination": "10.0.0.0/8",
-      "status": "Updated"
-    },
-    {
-      "region": "us-west-2",
-      "vpc_name": "egress-inspection-vpc-*",
-      "route_table_name": "*Firewall*",
-      "route_table_id": "rtb-0ceaec6d63cc46642",
-      "destination": "10.0.0.0/8",
-      "status": "Updated"
+      "vpn_id": "vpn-0aa2b60979b852fa6",
+      "status": "Failed"
     }
   ]
 }

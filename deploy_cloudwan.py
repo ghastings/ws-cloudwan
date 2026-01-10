@@ -116,6 +116,54 @@ def deploy_network_policy(nm_client, core_network_id: str, step: str = "initial"
         return {'status': 'failed', 'error': error_msg}
 
 
+def wait_for_attachments_available(nm_client, core_network_id: str, max_wait: int = 600):
+    """Wait for all attachments to be in AVAILABLE state, accepting pending ones"""
+    start_time = time.time()
+    
+    while time.time() - start_time < max_wait:
+        try:
+            response = nm_client.list_attachments(CoreNetworkId=core_network_id)
+            attachments = response.get('Attachments', [])
+            
+            if not attachments:
+                print("No attachments found")
+                return True
+            
+            # Accept any pending attachments
+            pending_acceptance = [a for a in attachments if a['State'] == 'PENDING_ATTACHMENT_ACCEPTANCE']
+            for att in pending_acceptance:
+                att_id = att['AttachmentId']
+                print(f"  Accepting attachment: {att_id}")
+                try:
+                    nm_client.accept_attachment(AttachmentId=att_id)
+                except Exception as e:
+                    print(f"  Warning: Could not accept {att_id}: {e}")
+            
+            creating = [a for a in attachments if a['State'] in ['CREATING', 'PENDING_ATTACHMENT_ACCEPTANCE', 'PENDING_NETWORK_UPDATE']]
+            available = [a for a in attachments if a['State'] == 'AVAILABLE']
+            failed = [a for a in attachments if a['State'] in ['FAILED', 'REJECTED']]
+            
+            if failed:
+                print(f"✗ {len(failed)} attachment(s) failed")
+                for att in failed:
+                    print(f"  {att.get('AttachmentId')}: {att['State']}")
+                return False
+            
+            if creating:
+                print(f"Waiting for {len(creating)} attachment(s) to be available... ({len(available)}/{len(attachments)} ready)")
+                time.sleep(30)
+            else:
+                print(f"✓ All {len(attachments)} attachments are available")
+                return True
+                
+        except Exception as e:
+            print(f"Error checking attachment status: {e}")
+            time.sleep(30)
+    
+    print("Timeout waiting for attachments")
+    return False
+
+
 def wait_for_policy_generation(nm_client, core_network_id: str, policy_version_id: int, max_wait: int = 300):
     """Wait for policy generation to complete before executing"""
     start_time = time.time()
@@ -475,15 +523,15 @@ def create_all_attachments(session, core_network_id: str) -> List[Dict[str, Any]
     
     attachments_config = [
         # Stockholm
-        AttachmentConfig("stockholm-prod", "stockholm", False, "VPC-prod", "domain", "prod"),
-        AttachmentConfig("stockholm-thirdparty", "stockholm", False, "VPC-thirdparty", "domain", "thirdparty"),
-        AttachmentConfig("stockholm-eastwestinspection", "stockholm", True, "eastwest-inspection", "nfg", "eastwestinspection"),
-        AttachmentConfig("stockholm-egressinspection", "stockholm", True, "egress-inspection", "nfg", "egressinspection"),
+        AttachmentConfig("stockholm-prod", "stockholm", False, "prod-vpc-*", "domain", "prod"),
+        AttachmentConfig("stockholm-thirdparty", "stockholm", False, "thirdparty-vpc-*", "domain", "thirdparty"),
+        AttachmentConfig("stockholm-eastwestinspection", "stockholm", True, "eastwest-inspection-vpc-*", "nfg", "eastwestinspection"),
+        AttachmentConfig("stockholm-egressinspection", "stockholm", True, "egress-inspection-vpc-*", "nfg", "egressinspection"),
         # Oregon
-        AttachmentConfig("oregon-prod", "oregon", False, "VPC-prod", "domain", "prod"),
-        AttachmentConfig("oregon-thirdparty", "oregon", False, "VPC-thirdparty", "domain", "thirdparty"),
-        AttachmentConfig("oregon-eastwestinspection", "oregon", True, "eastwest-inspection", "nfg", "eastwestinspection"),
-        AttachmentConfig("oregon-egressinspection", "oregon", True, "egress-inspection", "nfg", "egressinspection"),
+        AttachmentConfig("oregon-prod", "oregon", False, "prod-vpc-*", "domain", "prod"),
+        AttachmentConfig("oregon-thirdparty", "oregon", False, "thirdparty-vpc-*", "domain", "thirdparty"),
+        AttachmentConfig("oregon-eastwestinspection", "oregon", True, "eastwest-inspection-vpc-*", "nfg", "eastwestinspection"),
+        AttachmentConfig("oregon-egressinspection", "oregon", True, "egress-inspection-vpc-*", "nfg", "egressinspection"),
     ]
     
     vpn_attachments_config = [
@@ -498,15 +546,28 @@ def create_all_attachments(session, core_network_id: str) -> List[Dict[str, Any]
         print(f"\nProcessing {config.name} in {region}...")
         
         ec2_client = session.client('ec2', region_name=region)
-        subnet_ids = get_subnets_for_vpc(ec2_client, config.vpc_id)
+        
+        # Look up VPC ID by name pattern
+        vpc_id = get_vpc_id_by_name(ec2_client, config.vpc_id)
+        if not vpc_id:
+            print(f"Warning: VPC not found matching pattern {config.vpc_id} in {region}")
+            results.append({'name': config.name, 'region': region, 'status': 'Failed - VPC not found'})
+            continue
+        
+        print(f"  Found VPC: {vpc_id}")
+        subnet_ids = get_subnets_for_vpc(ec2_client, vpc_id)
         
         if not subnet_ids:
-            print(f"Warning: No subnets found for {config.vpc_id} in {region}")
-            results.append({'name': config.name, 'region': region, 'status': 'Failed - No subnets'})
+            print(f"Warning: No subnets found for {vpc_id} in {region}")
+            results.append({'name': config.name, 'region': region, 'vpc_id': vpc_id, 'status': 'Failed - No subnets'})
             continue
         
         print(f"Found {len(subnet_ids)} subnets: {subnet_ids}")
-        result = create_cloudwan_attachment(nm_client, core_network_id, config, subnet_ids, account_id)
+        
+        # Update config with actual VPC ID for attachment creation
+        actual_config = AttachmentConfig(config.name, config.edge_location, config.appliance_mode, 
+                                        vpc_id, config.tag_key, config.tag_value)
+        result = create_cloudwan_attachment(nm_client, core_network_id, actual_config, subnet_ids, account_id)
         
         if result:
             attachment_id = result.get('VpcAttachment', {}).get('AttachmentId')
@@ -551,7 +612,14 @@ def load_env_file(env_file: str) -> Dict[str, str]:
         with open(env_file, 'r') as f:
             for line in f:
                 line = line.strip()
-                if line and '=' in line and not line.startswith('#'):
+                # Skip comments and empty lines
+                if not line or line.startswith('#'):
+                    continue
+                # Remove 'export ' prefix if present
+                if line.startswith('export '):
+                    line = line[7:]
+                # Parse key=value
+                if '=' in line:
                     key, value = line.split('=', 1)
                     # Remove quotes if present
                     value = value.strip().strip('"').strip("'")
@@ -631,7 +699,12 @@ def main():
         else:
             results['errors'].append(f"Policy deployment failed: {policy_result.get('error')}")
             print("✗ Network policy deployment failed")
-            if args.step == '2-update-core-network-policy':
+            if args.step == 'all':
+                print("\nStopping execution due to failure in 'all' mode")
+                with open('cloudwan_deployment_results.json', 'w') as f:
+                    json.dump(results, f, indent=2)
+                sys.exit(1)
+            elif args.step == '2-update-core-network-policy':
                 sys.exit(1)
     
     # Step 3: Configure Site-to-Site VPN
@@ -646,7 +719,12 @@ def main():
         if not onprem_ip:
             results['errors'].append("Could not find onprem instance IP in eu-west-2")
             print("✗ Could not find onprem instance IP in eu-west-2")
-            if args.step == '3-configure-site-to-site-vpn':
+            if args.step == 'all':
+                print("\nStopping execution due to failure in 'all' mode")
+                with open('cloudwan_deployment_results.json', 'w') as f:
+                    json.dump(results, f, indent=2)
+                sys.exit(1)
+            elif args.step == '3-configure-site-to-site-vpn':
                 sys.exit(1)
         else:
             print(f"Found onprem instance IP: {onprem_ip}")
@@ -663,10 +741,20 @@ def main():
                 else:
                     results['errors'].append("VPN creation timed out")
                     print("✗ VPN creation timed out")
+                    if args.step == 'all':
+                        print("\nStopping execution due to failure in 'all' mode")
+                        with open('cloudwan_deployment_results.json', 'w') as f:
+                            json.dump(results, f, indent=2)
+                        sys.exit(1)
             else:
                 results['errors'].append(f"VPN creation failed: {vpn_result.get('error')}")
                 print("✗ Site-to-Site VPN creation failed")
-                if args.step == '3-configure-site-to-site-vpn':
+                if args.step == 'all':
+                    print("\nStopping execution due to failure in 'all' mode")
+                    with open('cloudwan_deployment_results.json', 'w') as f:
+                        json.dump(results, f, indent=2)
+                    sys.exit(1)
+                elif args.step == '3-configure-site-to-site-vpn':
                     sys.exit(1)
     
     # Step 4: Create Attachments
@@ -681,6 +769,16 @@ def main():
             results['steps_completed'].append('4-create-attachments')
             results['attachments'] = attachment_results
             print("✓ Attachment creation completed")
+            
+            # Wait for attachments to be available before continuing
+            if args.step == 'all':
+                print("\nWaiting for attachments to be available...")
+                if not wait_for_attachments_available(nm_client, args.core_network_id):
+                    results['errors'].append("Attachment creation failed or timed out")
+                    print("\nStopping execution due to failure in 'all' mode")
+                    with open('cloudwan_deployment_results.json', 'w') as f:
+                        json.dump(results, f, indent=2)
+                    sys.exit(1)
         else:
             results['errors'].append("Attachment creation failed")
             print("✗ Attachment creation failed")
@@ -700,7 +798,12 @@ def main():
         else:
             results['errors'].append(f"Routing policy deployment failed: {routing_result.get('error')}")
             print("✗ Routing policy deployment failed")
-            if args.step == '5-update-core-network-policy-for-routing':
+            if args.step == 'all':
+                print("\nStopping execution due to failure in 'all' mode")
+                with open('cloudwan_deployment_results.json', 'w') as f:
+                    json.dump(results, f, indent=2)
+                sys.exit(1)
+            elif args.step == '5-update-core-network-policy-for-routing':
                 sys.exit(1)
     
     # Step 7: Update VPC Route Tables
@@ -722,10 +825,20 @@ def main():
             
             if successful < total:
                 results['errors'].append(f"{total - successful} route table updates failed")
+                if args.step == 'all':
+                    print("\nStopping execution due to failure in 'all' mode")
+                    with open('cloudwan_deployment_results.json', 'w') as f:
+                        json.dump(results, f, indent=2)
+                    sys.exit(1)
         else:
             results['errors'].append("Route table update failed")
             print("✗ Route table update failed")
-            if args.step == '7-update-vpc-route-tables':
+            if args.step == 'all':
+                print("\nStopping execution due to failure in 'all' mode")
+                with open('cloudwan_deployment_results.json', 'w') as f:
+                    json.dump(results, f, indent=2)
+                sys.exit(1)
+            elif args.step == '7-update-vpc-route-tables':
                 sys.exit(1)
     
     # Final Summary
