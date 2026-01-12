@@ -1,3 +1,4 @@
+cloudwan_deployment_results.json
 # Secrets and credentials
 *.env
 secret.env

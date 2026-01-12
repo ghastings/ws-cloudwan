@@ -116,7 +116,7 @@ def deploy_network_policy(nm_client, core_network_id: str, step: str = "initial"
         return {'status': 'failed', 'error': error_msg}
 
 
-def wait_for_attachments_available(nm_client, core_network_id: str, max_wait: int = 600):
+def wait_for_attachments_available(nm_client, core_network_id: str, max_wait: int = 1200):
     """Wait for all attachments to be in AVAILABLE state, accepting pending ones"""
     start_time = time.time()
     
@@ -282,6 +282,11 @@ def create_site_to_site_vpn(ec2_client, onprem_ip: str) -> Dict[str, Any]:
         }
         
     except Exception as e:
+        error_msg = str(e)
+        # Check if it's an "already exists" error
+        if 'already exists' in error_msg.lower() or 'duplicate' in error_msg.lower():
+            print(f"VPN connection already exists, continuing...")
+            return {'status': 'success', 'vpn_connection_id': None, 'customer_gateway_id': None}
         print(f"Error creating Site-to-Site VPN: {e}")
         return {'status': 'failed', 'error': str(e)}
 
@@ -434,6 +439,11 @@ def update_route_table(ec2_client, route_table_id: str, destination: str, core_n
         return True
         
     except Exception as e:
+        error_msg = str(e)
+        # Check if route already exists
+        if 'routealreadyexists' in error_msg.lower().replace(' ', ''):
+            print(f"Route already exists in {route_table_id}, continuing...")
+            return True
         print(f"Error updating route table {route_table_id}: {e}")
         return False
 
@@ -465,6 +475,11 @@ def create_cloudwan_vpn_attachment(nm_client, core_network_id: str, config: VPNA
         )
         return response
     except Exception as e:
+        error_msg = str(e)
+        # Check if it's an "already attached" error
+        if 'already attached' in error_msg.lower():
+            print(f"VPN already attached to Core Network, continuing...")
+            return {'SiteToSiteVpnAttachment': {'AttachmentId': 'existing'}}
         print(f"Error creating VPN attachment {config.name}: {e}")
         return {}
 
@@ -512,6 +527,11 @@ def create_cloudwan_attachment(nm_client, core_network_id: str, config: Attachme
     try:
         return nm_client.create_vpc_attachment(**params)
     except Exception as e:
+        error_msg = str(e)
+        # Check if it's an "already exists" error
+        if 'already exists' in error_msg.lower() or 'duplicate' in error_msg.lower():
+            print(f"Attachment already exists for {config.name}, continuing...")
+            return {'VpcAttachment': {'AttachmentId': 'existing'}}
         print(f"Error creating attachment {config.name}: {e}")
         return {}
 
@@ -630,6 +650,46 @@ def load_env_file(env_file: str) -> Dict[str, str]:
         sys.exit(1)
 
 
+def get_or_select_core_network(session) -> str:
+    """Get core network ID, prompting user if multiple exist"""
+    nm_client = session.client('networkmanager', region_name='us-west-2')
+    
+    try:
+        response = nm_client.list_core_networks()
+        core_networks = response.get('CoreNetworks', [])
+        
+        if not core_networks:
+            print("Error: No core networks found in your account")
+            sys.exit(1)
+        
+        if len(core_networks) == 1:
+            cn_id = core_networks[0]['CoreNetworkId']
+            print(f"Found core network: {cn_id}")
+            return cn_id
+        
+        # Multiple core networks - prompt user
+        print("\nMultiple core networks found:")
+        for i, cn in enumerate(core_networks, 1):
+            cn_id = cn['CoreNetworkId']
+            state = cn['State']
+            print(f"  {i}. {cn_id} (State: {state})")
+        
+        while True:
+            try:
+                choice = input("\nSelect core network (enter number): ").strip()
+                idx = int(choice) - 1
+                if 0 <= idx < len(core_networks):
+                    return core_networks[idx]['CoreNetworkId']
+                print(f"Invalid choice. Please enter a number between 1 and {len(core_networks)}")
+            except (ValueError, KeyboardInterrupt):
+                print("\nError: Invalid input")
+                sys.exit(1)
+                
+    except Exception as e:
+        print(f"Error listing core networks: {e}")
+        sys.exit(1)
+
+
 def extract_core_network_id(value: str) -> str:
     """Extract core network ID from ARN or return as-is if already an ID"""
     if value.startswith('arn:aws:networkmanager'):
@@ -646,16 +706,13 @@ def main():
     parser.add_argument('--aws-secret-access-key', help='AWS Secret Access Key')
     parser.add_argument('--aws-session-token', help='AWS Session Token (optional)')
     parser.add_argument('--env-file', help='Path to .env file with AWS credentials')
-    parser.add_argument('--core-network-id', required=True, help='CloudWAN Core Network ID or ARN')
+    parser.add_argument('--core-network-id', help='CloudWAN Core Network ID or ARN (optional, will auto-detect if not provided)')
     parser.add_argument('--step', choices=['2-update-core-network-policy', '3-configure-site-to-site-vpn', 
                                           '4-create-attachments', '5-update-core-network-policy-for-routing', 
                                           '7-update-vpc-route-tables', 'all'], 
                        default='all', help='Deployment step to execute (default: all)')
     
     args = parser.parse_args()
-    
-    # Extract core network ID from ARN if needed
-    args.core_network_id = extract_core_network_id(args.core_network_id)
     
     # Load credentials from env file or command line
     if args.env_file:
@@ -679,7 +736,13 @@ def main():
         aws_session_token=session_token
     )
     
-    print(f"Using Core Network ID: {args.core_network_id}")
+    # Get or select core network ID
+    if args.core_network_id:
+        args.core_network_id = extract_core_network_id(args.core_network_id)
+        print(f"Using Core Network ID: {args.core_network_id}")
+    else:
+        args.core_network_id = get_or_select_core_network(session)
+    
     print(f"Executing step: {args.step}")
     
     results = {'steps_completed': [], 'errors': []}
@@ -701,8 +764,6 @@ def main():
             print("✗ Network policy deployment failed")
             if args.step == 'all':
                 print("\nStopping execution due to failure in 'all' mode")
-                with open('cloudwan_deployment_results.json', 'w') as f:
-                    json.dump(results, f, indent=2)
                 sys.exit(1)
             elif args.step == '2-update-core-network-policy':
                 sys.exit(1)
@@ -721,8 +782,6 @@ def main():
             print("✗ Could not find onprem instance IP in eu-west-2")
             if args.step == 'all':
                 print("\nStopping execution due to failure in 'all' mode")
-                with open('cloudwan_deployment_results.json', 'w') as f:
-                    json.dump(results, f, indent=2)
                 sys.exit(1)
             elif args.step == '3-configure-site-to-site-vpn':
                 sys.exit(1)
@@ -743,16 +802,12 @@ def main():
                     print("✗ VPN creation timed out")
                     if args.step == 'all':
                         print("\nStopping execution due to failure in 'all' mode")
-                        with open('cloudwan_deployment_results.json', 'w') as f:
-                            json.dump(results, f, indent=2)
                         sys.exit(1)
             else:
                 results['errors'].append(f"VPN creation failed: {vpn_result.get('error')}")
                 print("✗ Site-to-Site VPN creation failed")
                 if args.step == 'all':
                     print("\nStopping execution due to failure in 'all' mode")
-                    with open('cloudwan_deployment_results.json', 'w') as f:
-                        json.dump(results, f, indent=2)
                     sys.exit(1)
                 elif args.step == '3-configure-site-to-site-vpn':
                     sys.exit(1)
@@ -776,8 +831,6 @@ def main():
                 if not wait_for_attachments_available(nm_client, args.core_network_id):
                     results['errors'].append("Attachment creation failed or timed out")
                     print("\nStopping execution due to failure in 'all' mode")
-                    with open('cloudwan_deployment_results.json', 'w') as f:
-                        json.dump(results, f, indent=2)
                     sys.exit(1)
         else:
             results['errors'].append("Attachment creation failed")
@@ -800,8 +853,6 @@ def main():
             print("✗ Routing policy deployment failed")
             if args.step == 'all':
                 print("\nStopping execution due to failure in 'all' mode")
-                with open('cloudwan_deployment_results.json', 'w') as f:
-                    json.dump(results, f, indent=2)
                 sys.exit(1)
             elif args.step == '5-update-core-network-policy-for-routing':
                 sys.exit(1)
@@ -827,16 +878,12 @@ def main():
                 results['errors'].append(f"{total - successful} route table updates failed")
                 if args.step == 'all':
                     print("\nStopping execution due to failure in 'all' mode")
-                    with open('cloudwan_deployment_results.json', 'w') as f:
-                        json.dump(results, f, indent=2)
                     sys.exit(1)
         else:
             results['errors'].append("Route table update failed")
             print("✗ Route table update failed")
             if args.step == 'all':
                 print("\nStopping execution due to failure in 'all' mode")
-                with open('cloudwan_deployment_results.json', 'w') as f:
-                    json.dump(results, f, indent=2)
                 sys.exit(1)
             elif args.step == '7-update-vpc-route-tables':
                 sys.exit(1)
@@ -851,11 +898,6 @@ def main():
         print(f"Errors encountered: {len(results['errors'])}")
         for error in results['errors']:
             print(f"  - {error}")
-    
-    with open('cloudwan_deployment_results.json', 'w') as f:
-        json.dump(results, f, indent=2)
-    
-    print(f"\nResults saved to: cloudwan_deployment_results.json")
 
 
 if __name__ == "__main__":
