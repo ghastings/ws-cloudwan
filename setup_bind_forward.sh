@@ -49,6 +49,7 @@ RESOLVER_IP1=$1
 RESOLVER_IP2=${2:-}
 
 NAMED_CONF="/etc/bind/named.conf.local"
+NAMED_OPTIONS="/etc/bind/named.conf.options"
 BACKUP_DIR="/tmp/bind_backup_$(date +%Y%m%d_%H%M%S)"
 
 echo "Configuring BIND to forward $DOMAIN to AWS Route 53 Resolver..."
@@ -58,6 +59,17 @@ mkdir -p "$BACKUP_DIR"
 if [ -f "$NAMED_CONF" ]; then
     cp "$NAMED_CONF" "$BACKUP_DIR/"
     echo "Backed up existing config to $BACKUP_DIR"
+fi
+if [ -f "$NAMED_OPTIONS" ]; then
+    cp "$NAMED_OPTIONS" "$BACKUP_DIR/"
+fi
+
+# Disable DNSSEC validation
+echo "Disabling DNSSEC validation..."
+if grep -q "dnssec-validation" "$NAMED_OPTIONS"; then
+    sudo sed -i 's/dnssec-validation .*/dnssec-validation no;/' "$NAMED_OPTIONS"
+else
+    sudo sed -i '/options {/a \    dnssec-validation no;' "$NAMED_OPTIONS"
 fi
 
 # Create zone configuration
