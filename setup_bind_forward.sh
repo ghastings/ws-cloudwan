@@ -38,15 +38,8 @@ if [ "$1" = "natonly" ]; then
 fi
 
 # Normal mode - configure BIND and NAT
-if [ "$#" -lt 1 ]; then
-    echo "Usage: $0 <resolver-ip-1> [resolver-ip-2]"
-    echo "       $0 natonly"
-    echo "Example: $0 10.0.1.251 10.0.0.66"
-    exit 1
-fi
-
-RESOLVER_IP1=$1
-RESOLVER_IP2=${2:-}
+RESOLVER_IP1=${1:-"10.0.0.66"}
+RESOLVER_IP2=${2:-"10.0.1.66"}
 
 NAMED_CONF="/etc/bind/named.conf.local"
 NAMED_OPTIONS="/etc/bind/named.conf.options"
