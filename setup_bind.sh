@@ -11,7 +11,7 @@ systemctl restart networkd-dispatcher.service
 
 # Use static IP address
 IP_ADDRESS="192.168.100.53"
-DOMAIN="epic.aws"
+DOMAIN="examplecorp.aws"
 SOURCE_NAT_IP="192.168.100.53"
 
 echo "Using IP address: $IP_ADDRESS"

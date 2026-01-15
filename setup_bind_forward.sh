@@ -7,7 +7,7 @@
 
 set -e
 
-DOMAIN="epic.aws"
+DOMAIN="examplecorp.aws"
 SOURCE_NAT_IP="192.168.100.53"
 
 # Check for natonly mode

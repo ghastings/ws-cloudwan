@@ -22,7 +22,7 @@ python deploy_cloudwan.py
 Complete BIND9 DNS server setup for on-premises simulation:
 - Installs and configures BIND9 and nginx
 - Creates local `.onprem` zone (www.onprem → 192.168.100.53)
-- Configures forwarding for `epic.aws` domain to AWS Route 53 resolvers
+- Configures forwarding for `examplecorp.aws` domain to AWS Route 53 resolvers
 - Disables DNSSEC validation for AWS forwarding
 - Sets up iptables NAT rules to source DNS traffic from 192.168.100.53
 - Defaults to resolver IPs: 10.0.0.66 and 10.0.1.66
@@ -42,7 +42,7 @@ Complete BIND9 DNS server setup for on-premises simulation:
 ### setup_bind_forward.sh
 
 Standalone script for configuring AWS Route 53 forwarding on existing BIND installations:
-- Adds `epic.aws` forwarding zone
+- Adds `examplecorp.aws` forwarding zone
 - Disables DNSSEC validation
 - Configures iptables NAT rules
 - Defaults to resolver IPs: 10.0.0.66 and 10.0.1.66
@@ -89,7 +89,7 @@ dig @localhost www.onprem
 
 ### Test AWS DNS Forwarding
 ```bash
-dig @localhost test.epic.aws
+dig @localhost test.examplecorp.aws
 ```
 
 ### Verify NAT Rules
