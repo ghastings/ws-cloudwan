@@ -1,0 +1,32 @@
+name: Dave Issue Pipeline
+
+on:
+  issues:
+    types: [labeled]
+
+jobs:
+  notify-dave:
+    runs-on: ubuntu-latest
+    if: github.event.label.name == 'dave'
+    steps:
+      - name: Build label array
+        id: labels
+        run: |
+          LABELS=$(echo '${{ toJSON(github.event.issue.labels) }}' | jq -c '[.[].name]')
+          echo "json=$LABELS" >> "$GITHUB_OUTPUT"
+
+      - name: POST issue to Dave webhook
+        run: |
+          curl --fail-with-body -s -X POST \
+            "${{ secrets.DAVE_WEBHOOK_URL }}" \
+            -H "Authorization: Bearer ${{ secrets.DAVE_AUTH_TOKEN }}" \
+            -H "Content-Type: application/json" \
+            -d @- <<EOF
+          {
+            "repo_url": "${{ github.server_url }}/${{ github.repository }}",
+            "issue_number": ${{ github.event.issue.number }},
+            "issue_title": ${{ toJSON(github.event.issue.title) }},
+            "issue_body": ${{ toJSON(github.event.issue.body) }},
+            "issue_labels": ${{ steps.labels.outputs.json }}
+          }
+          EOF
